@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# Copyright (c) 2013, 2014 Martin Raspaud
+# Copyright (c) 2013, 2014, 2015 Martin Raspaud
 
 # Author(s):
 
@@ -22,29 +22,27 @@
 
 """Scheduling
 """
-from tempfile import mkstemp
 import logging
 import logging.handlers
-import operator
 import urlparse
 import os
 from datetime import datetime, timedelta
 from pprint import pformat
 import numpy as np
 from pyresample import utils
-from pyorbital import (orbital, geoloc, geoloc_instrument_definitions,
-                       astronomy, tlefile)
-from trollsched.spherical import SphPolygon, get_twilight_poly
+from pyorbital import astronomy
+from trollsched.spherical import get_twilight_poly
 from trollsched.graph import Graph
-from trollsched.satpass import get_next_passes, Boundary
+from trollsched.satpass import get_next_passes, SimplePass
+from trollsched.boundary import AreaDefBoundary
 
 from ConfigParser import ConfigParser
-import glob
 
 logger = logging.getLogger(__name__)
 
 # shortest allowed pass in minutes
 MIN_PASS = 4
+
 
 def conflicting_passes(allpasses, delay=timedelta(seconds=0)):
     """Get the passes in groups of conflicting passes.
@@ -70,6 +68,7 @@ def conflicting_passes(allpasses, delay=timedelta(seconds=0)):
     groups.append(group)
     return groups
 
+
 def get_non_conflicting_groups(passes, delay=timedelta(seconds=0)):
     """Get the different non-conflicting solutions in a group of conflicting
     passes.
@@ -84,7 +83,7 @@ def get_non_conflicting_groups(passes, delay=timedelta(seconds=0)):
     graph = Graph(order)
 
     for i, overpass in enumerate(sorted(passes, key=lambda x: x.risetime)):
-        for j in range(i+1, order):
+        for j in range(i + 1, order):
             if not overpass.overlaps(passes[j], delay):
                 graph.add_edge(i, j)
 
@@ -101,16 +100,18 @@ def get_non_conflicting_groups(passes, delay=timedelta(seconds=0)):
 def fermia(t):
     a = 0.25
     b = a / 4
-    k = b * np.log(1/3.0) + a
+    k = b * np.log(1 / 3.0) + a
     sh = k - 0.25
-    return 0.5/(np.exp(((t + sh) - a) / b) + 1) + 0.5
+    return 0.5 / (np.exp(((t + sh) - a) / b) + 1) + 0.5
+
 
 def fermib(t):
     a = 0.25
     b = a / 4
-    return 1/(np.exp((t - a) / b) + 1)
+    return 1 / (np.exp((t - a) / b) + 1)
 
 combination = {}
+
 
 def combine(p1, p2, area_of_interest, scores):
     """Combine passes together.
@@ -123,7 +124,6 @@ def combine(p1, p2, area_of_interest, scores):
 
     area = area_of_interest.poly.area()
 
-
     def pscore(poly, coeff=1):
         if poly is None:
             return 0
@@ -135,7 +135,7 @@ def combine(p1, p2, area_of_interest, scores):
 
     ip1, sip1 = p1.score.get(area_of_interest, (None, None))
     if sip1 is None:
-        ip1 = p1.boundary.contour_poly().intersection(area_of_interest.poly)
+        ip1 = p1.boundary.contour_poly.intersection(area_of_interest.poly)
         # FIXME: ip1 or ip2 could be None if the pass is entirely inside the
         # area (or vice versa)
         if ip1 is None:
@@ -163,7 +163,7 @@ def combine(p1, p2, area_of_interest, scores):
 
     ip2, sip2 = p2.score.get(area_of_interest, (None, None))
     if sip2 is None:
-        ip2 = p2.boundary.contour_poly().intersection(area_of_interest.poly)
+        ip2 = p2.boundary.contour_poly.intersection(area_of_interest.poly)
         if ip2 is None:
             return 0
 
@@ -186,7 +186,6 @@ def combine(p1, p2, area_of_interest, scores):
         ds2 = pscore(ip2d, scores[p2.satellite][1] / area)
         sip2 = ns2 + ds2
         p2.score[area_of_interest] = (ip2, sip2)
-
 
     ip1p2 = ip1.intersection(ip2)
 
@@ -223,9 +222,12 @@ def combine(p1, p2, area_of_interest, scores):
     return res
 
 
-def get_best_sched(overpasses, area_of_interest, scores, delay):
+def get_best_sched(overpasses, area_of_interest, scores, delay, avoid_list=None):
     """Get the best schedule based on *area_of_interest*.
     """
+    avoid_list = avoid_list or []
+    print avoid_list
+    raw_input()
     passes = sorted(overpasses, key=lambda x: x.risetime)
     grs = conflicting_passes(passes, delay)
     logger.debug("conflicting %s", str(grs))
@@ -235,11 +237,14 @@ def get_best_sched(overpasses, area_of_interest, scores, delay):
 
     graph = Graph(n_vertices=n_vertices + 2)
 
-
     def add_arc(graph, p1, p2, hook=None):
         logger.debug("Adding arc between " + str(p1) +
                      " and " + str(p2) + "...")
-        w = combine(p1, p2, area_of_interest, scores)
+        if p1 in avoid_list or p2 in avoid_list:
+            w = 0
+            logger.debug("...0 because in the avoid_list!")
+        else:
+            w = combine(p1, p2, area_of_interest, scores)
         logger.debug("...with weight " + str(w))
 
         with open("/tmp/schedule.gv", "a") as fp_:
@@ -264,7 +269,6 @@ def get_best_sched(overpasses, area_of_interest, scores, delay):
                 for p1, p2 in zip(gr[:-1], gr[1:]):
                     add_arc(graph, p1, p2)
 
-
     for pr in prev:
         graph.add_arc(passes.index(pr) + 1, n_vertices + 1)
     for first in ncgrs[0][0]:
@@ -279,6 +283,7 @@ def get_best_sched(overpasses, area_of_interest, scores, delay):
 def argmax(iterable):
     return max((x, i) for i, x in enumerate(iterable))[1]
 
+
 def get_max(groups, fun):
     """Get the best group of *groups* using the score function *fun*
     """
@@ -286,6 +291,7 @@ def get_max(groups, fun):
     for grp in groups:
         scores.append(sum([fun(p) for p in grp]))
     return groups[argmax(scores)]
+
 
 def generate_sch_file(output_file, overpasses, coords):
 
@@ -302,12 +308,14 @@ def generate_sch_file(output_file, overpasses, coords):
         out.write(sats)
         out.write("#\n#\n#Pass List\n#\n")
 
-        out.write("#SCName          RevNum Risetime        Falltime        Elev Dura ANL   Rec Dir Man Ovl OvlSCName        OvlRev OvlRisetime     OrigRisetime    OrigFalltime    OrigDuration\n#\n")
+        out.write(
+            "#SCName          RevNum Risetime        Falltime        Elev Dura ANL   Rec Dir Man Ovl OvlSCName        OvlRev OvlRisetime     OrigRisetime    OrigFalltime    OrigDuration\n#\n")
 
         for overpass in sorted(overpasses):
             out.write(overpass.print_vcs(coords) + "\n")
 
-def generate_xml_requests(sched, start, end, station_name):
+
+def generate_xml_requests(sched, start, end, station_name, report_mode=False):
     """Create xml requests.
     """
     import xml.etree.ElementTree as ET
@@ -321,7 +329,7 @@ def generate_xml_requests(sched, start, end, station_name):
             "terra": "terra",
             "aqua": "aqua",
             "suomi npp": "npp",
-        }
+            }
 
     reqtime = datetime.utcnow()
     eum_format = "%Y-%m-%d-%H:%M:%S"
@@ -343,37 +351,53 @@ def generate_xml_requests(sched, start, end, station_name):
     reqon = ET.SubElement(props, "requested-on")
     reqon.text = reqtime.strftime(eum_format)
     for overpass in sorted(sched):
-        if overpass.rec and overpass.risetime > start:
+        if (overpass.rec or report_mode) and overpass.risetime > start:
             ovpass = ET.SubElement(root, "pass")
             ovpass.set("satellite", sats.get(overpass.satellite,
                                              overpass.satellite))
             ovpass.set("start-time", overpass.risetime.strftime(eum_format))
             ovpass.set("end-time", overpass.falltime.strftime(eum_format))
+            if report_mode:
+                if overpass.fig is not None:
+                    ovpass.set("img", overpass.fig)
+                ovpass.set("rec", str(overpass.rec))
 
     return root, reqtime
 
-def generate_xml_file(sched, start, end, directory, station):
+
+def generate_xml_file(sched, start, end, directory, station, report_mode=False):
     """Create an xml request file.
     """
     import xml.etree.ElementTree as ET
-    tree, reqtime = generate_xml_requests(sched, start, end, station)
+    tree, reqtime = generate_xml_requests(sched,
+                                          start, end,
+                                          station, report_mode)
+    if report_mode:
+        mode = "report"
+    else:
+        mode = "request"
     filename = (reqtime.strftime("%Y-%m-%d-%H-%M-%S")
-                + "-acquisition-schedule-request-"
+                + "-acquisition-schedule-" + mode + "-"
                 + station + ".xml")
     filename = os.path.join(directory, filename)
     tmp_filename = (reqtime.strftime("%Y-%m-%d-%H-%M-%S")
-                    + "-acquisition-schedule-request-"
+                    + "-acquisition-schedule-" + mode + "-"
                     + station + ".tmp")
     tmp_filename = os.path.join(directory, tmp_filename)
     with open(tmp_filename, "w") as fp_:
+        if report_mode:
+            fp_.write("<?xml version='1.0' encoding='utf-8'?>"
+                      "<?xml-stylesheet type='text/xsl' href='reqreader.xsl'?>")
         fp_.write(ET.tostring(tree))
     os.rename(tmp_filename, filename)
     return filename
+
 
 def parse_datetime(strtime):
     """Parse the time string *strtime*
     """
     return datetime.strptime(strtime, "%Y%m%d%H%M%S")
+
 
 def read_config(filename):
     """Read the config file *filename* and replace the values in global
@@ -384,7 +408,7 @@ def read_config(filename):
 
     station = cfg.get("default", "station")
     satellites = cfg.get("default", "satellites").split(",")
-    forward = cfg.getfloat("default", "forward")
+    forward = cfg.getint("default", "forward")
     start = cfg.getfloat("default", "start")
 
     station_name = cfg.get(station, "name")
@@ -400,9 +424,24 @@ def read_config(filename):
     area = utils.parse_area_file(cfg.get(station, "area_file"),
                                  cfg.get(station, "area"))[0]
 
-
     return ((station_lon, station_lat, station_alt),
             sat_scores, station_name, area, forward, start)
+
+
+def save_passes(allpasses, poly, output_dir):
+    for passage in allpasses:
+        passage.save_fig(poly, directory=output_dir)
+
+def get_passes_from_xml_file(filename):
+    import xml.etree.ElementTree as ET
+    tree = ET.parse(filename)
+    root = tree.getroot()
+    pass_list = []
+    for overpass in root.iter('pass'):
+        start_time = datetime.strptime(overpass.attrib['start-time'], '%Y-%m-%d-%H:%M:%S')
+        end_time = datetime.strptime(overpass.attrib['end-time'], '%Y-%m-%d-%H:%M:%S')
+        pass_list.append(SimplePass(overpass.attrib['satellite'], start_time, end_time))
+    return pass_list
 
 def run():
     """The schedule command
@@ -422,8 +461,8 @@ def run():
                         default=None)
     parser.add_argument("-v", "--verbose", help="print debug messages too",
                         action="store_true")
-    parser.add_argument("-g", "--graph", help="save graph info to disk",
-                        action="store_true")
+    parser.add_argument("-g", "--graph", help="save graph info to this directory",
+                        default=None)
     parser.add_argument("-t", "--tle", help="tle file to use", default=None)
     parser.add_argument("-f", "--forward", type=float,
                         help="time ahead to compute the schedule")
@@ -435,23 +474,33 @@ def run():
                         + "consecutive passes (60 seconds by default)")
     parser.add_argument("-c", "--config", help="configuration file to use",
                         default=None)
+    parser.add_argument("-o", "--output-dir",
+                        help="where to put generated plots",
+                        default=None)
+    parser.add_argument("-a", "--avoid", help="xml request file with passes to avoid")
     group = parser.add_argument_group(title="output")
-    group.add_argument("-x", "--xml", default=".",
-                        help="generate an xml request file and"
-                       " put it in this directory. Could be a url")
+    group.add_argument("-x", "--xml",
+                       help="generate an xml request file and"
+                       " put it in this directory. Could be a url",
+                       default=None)
+    group.add_argument("-r", "--report",
+                       help="generate an xml report file and"
+                       " put it in this directory. Could be a url",
+                       default=None)
     group.add_argument("--scisys", default=None,
-                        help="path to the schedule file")
+                       help="path to the schedule file")
 
     opts = parser.parse_args()
 
     if opts.config:
-        coords, scores, station, area, forward, start = read_config(opts.config)
+        coords, scores, station, area, forward, start = read_config(
+            opts.config)
 
     if (not opts.config) and (not (opts.lon or opts.lat or opts.alt)):
         parser.error("Coordinates must be provided in the absence of "
                      "configuration file.")
 
-    if not (opts.xml or opts.scisys):
+    if not (opts.xml or opts.scisys or opts.report):
         parser.error("No output specified, use '--scisys' or '-x/--xml'")
 
     if opts.log:
@@ -482,23 +531,16 @@ def run():
         mhandler.setLevel(logging.WARNING)
         logging.getLogger('').addHandler(mhandler)
 
-
     logger = logging.getLogger("trollsched")
 
     if opts.lon and opts.lat and opts.alt:
         coords = (opts.lon, opts.lat, opts.alt)
 
-
     # test line
-    # python schedule.py -v 16.148649 58.581844 0.052765 -f 216 -s 20140118140000 -t tle_20140120.txt -x . --scisys myched.txt
+    # python schedule.py -v 16.148649 58.581844 0.052765 -f 216 -s
+    # 20140118140000 -t tle_20140120.txt -x . --scisys myched.txt
 
     satellites = scores.keys()
-
-    # satellites = ["noaa 19", "noaa 18", "noaa 16", "noaa 15",
-    #               "metop-a", "metop-b",
-    #               "terra", "aqua",
-    #               "suomi npp"]
-
 
     logger.info("Computing next satellite passes")
 
@@ -508,27 +550,34 @@ def run():
     if opts.start_time:
         start_time = opts.start_time
     else:
-        start_time = datetime.utcnow()# + timedelta(hours=start)
+        start_time = datetime.utcnow()
     allpasses = get_next_passes(satellites, start_time,
                                 forward, coords, tle_file)
-
 
     logger.info("Computation of next overpasses done")
 
     logger.debug(str(sorted(allpasses, key=lambda x: x.risetime)))
 
-    lons, lats = area.get_boundary_lonlats()
-    area_boundary = Boundary((lons.side1, lats.side1),
-                             (lons.side2, lats.side2),
-                             (lons.side3, lats.side3),
-                             (lons.side4, lats.side4))
-    area_boundary.decimate(500)
-    area.poly = area_boundary.contour_poly()
+    area_boundary = AreaDefBoundary(area, frequency=500)
+    area.poly = area_boundary.contour_poly
+
+    if opts.output_dir is not None:
+        logger.info("Saving plots to %s", opts.output_dir)
+        from threading import Thread
+        save_passes(allpasses, area.poly, opts.output_dir)
+        image_saver = Thread(target=save_passes, args=(allpasses, area.poly, opts.output_dir))
+        image_saver.start()
+
+
+    if opts.avoid is not None:
+        avoid_list = get_passes_from_xml_file(opts.avoid)
+    else:
+        avoid_list = None
 
     logger.info("computing best schedule for area euron1")
     schedule, (graph, labels) = get_best_sched(allpasses, area, scores,
-                                               timedelta(seconds=opts.delay))
-
+                                               timedelta(seconds=opts.delay),
+                                               avoid_list)
 
     logger.debug(pformat(schedule))
     for opass in schedule:
@@ -538,21 +587,27 @@ def run():
     if opts.scisys:
         generate_sch_file(opts.scisys, allpasses, coords)
 
-    if opts.xml:
-        url = urlparse.urlparse(opts.xml)
+    if opts.xml or opts.report:
+        url = urlparse.urlparse(opts.xml or opts.report)
         if url.scheme not in ["file", ""]:
             directory = "/tmp"
         else:
             directory = url.path
-        xmlfile = generate_xml_file(allpasses, start_time,
+        if opts.report:
+            logger.info("Waiting for images to be saved...")
+            image_saver.join()
+            logger.info("Done!")
+        xmlfile = generate_xml_file(allpasses, start_time + timedelta(hours=start),
                                     start_time + timedelta(hours=forward),
-                                    directory, station)
+                                    directory, station,
+                                    opts.report)
         logger.info("Generated " + str(xmlfile))
         pathname, filename = os.path.split(xmlfile)
         del pathname
         if url.scheme in ["file", ""]:
             pass
         elif url.scheme == "ftp":
+            import ftplib
             session = ftplib.FTP(url.hostname, url.username, url.password)
             with open(xmlfile, "rb") as xfile:
                 session.storbinary('STOR ' + str(filename), xfile)
@@ -561,14 +616,18 @@ def run():
             logger.error("Cannot save to " + str(url.scheme)
                          + ", but file is there" + str(xmlfile))
 
-    if opts.graph:
-        graph.save("my_graph")
-        graph.export(labels=[str(label) for label in labels])
+    if opts.graph is not None:
+        now = datetime.now()
+        graph.save("graph" + now.isoformat())
+        graph.export(labels=[str(label) for label in labels],
+                     filename=os.path.join(opts.graph,
+                                           "sched" + now.isoformat() + ".gv"))
 
 if __name__ == '__main__':
+    print get_passes_from_xml_file("trollsched/tmp.xml")
+    pause
     try:
         run()
     except:
         logger.exception("Something wrong happened!")
         raise
-

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-# Copyright (c) 2014 Martin Raspaud
+# Copyright (c) 2014, 2015 Martin Raspaud
 
 # Author(s):
 
@@ -23,25 +23,33 @@
 """Satellite passes.
 """
 
+import ftplib
+import glob
 import logging
 import logging.handlers
-import os
 import operator
+import os
+import socket
+import urlparse
 from datetime import datetime, timedelta
-from trollsched.spherical import SphPolygon
-import numpy as np
-from pyorbital import geoloc, geoloc_instrument_definitions, tlefile, orbital
 from tempfile import mkstemp
 
+import numpy as np
+
+from pyorbital import orbital, tlefile
+from trollsched.boundary import AreaDefBoundary, SwathBoundary
 
 logger = logging.getLogger(__name__)
 
 # shortest allowed pass in minutes
 MIN_PASS = 4
 
+
 class Mapper(object):
+
     """A class to generate nice plots with basemap.
     """
+
     def __init__(self):
         from mpl_toolkits.basemap import Basemap
 
@@ -62,208 +70,26 @@ class Mapper(object):
     def __exit__(self, etype, value, tb):
         pass
 
-class Boundary(object):
-    """Area boundary objects.
-    """
-    def __init__(self, *sides):
-        self.sides_lons, self.sides_lats = zip(*sides)
-        self.sides_lons = list(self.sides_lons)
-        self.sides_lats = list(self.sides_lats)
 
-        self._contour_poly = None
+class SimplePass(object):
 
-    def decimate(self, ratio):
-        """Remove some points in the boundaries, but never the corners.
-        """
-        for i in range(len(self.sides_lons)):
-            l = len(self.sides_lons[i])
-            start = (l % ratio) / 2
-            points = np.concatenate(([0], np.arange(start, l, ratio), [l-1]))
-
-            self.sides_lons[i] = self.sides_lons[i][points]
-            self.sides_lats[i] = self.sides_lats[i][points]
-
-
-
-    def contour(self):
-        """Get the (lons, lats) tuple of the boundary object.
-        """
-        lons = np.concatenate([lns[:-1] for lns in self.sides_lons])
-        lats = np.concatenate([lts[:-1] for lts in self.sides_lats])
-
-        return lons, lats
-
-    def contour_poly(self):
-        """Get the Spherical polygon corresponding to the Boundary
-        """
-        if self._contour_poly is None:
-            self._contour_poly = SphPolygon(np.deg2rad(np.vstack(self.contour()).T))
-        return self._contour_poly
-
-    def draw(self, mapper, options):
-        """Draw the current boundary on the *mapper*
-        """
-        self.contour_poly().draw(mapper, options)
-
-    def show(self, poly=None, other_poly=None):
-        """Show the current boundary.
-        """
-
-        import matplotlib.pyplot as plt
-        plt.clf()
-        with Mapper() as mapper:
-            self.draw(mapper, "-r")
-            if poly is not None:
-                poly.draw(mapper, "-b")
-            if other_poly is not None:
-                other_poly.draw(mapper, "-g")
-        plt.show()
-
-
-class SwathBoundary(Boundary):
-    """Boundaries for satellite overpasses.
-    """
-    def get_instrument_points(self, overpass, utctime,
-                              scans_nb, scanpoints, decimate=1):
-        """Get the boundary points for a given overpass.
-        """
-        instrument = overpass.instrument
-        # cheating at the moment.
-        scan_angle = 55.37
-        if instrument == "modis":
-            scan_angle = 55.0
-        elif instrument == "viirs":
-            scan_angle = 55.84
-        elif overpass.satellite == "noaa 16":
-            scan_angle = 55.25
-        instrument = "avhrr"
-        instrument_fun = getattr(geoloc_instrument_definitions, instrument)
-        sgeom = instrument_fun(scans_nb, scanpoints,
-                               scan_angle=scan_angle, decimate=decimate)
-        times = sgeom.times(utctime)
-        pixel_pos = geoloc.compute_pixels((self.orb.tle._line1,
-                                           self.orb.tle._line2),
-                                          sgeom, times)
-        lons, lats, alts = geoloc.get_lonlatalt(pixel_pos, times)
-
-        del alts
-        return (lons.reshape(-1, len(scanpoints)),
-                lats.reshape(-1, len(scanpoints)))
-
-    def __init__(self, overpass, decimate=500.0):
-        # compute area covered by pass
-
-        self.overpass = overpass
-        self.orb = overpass.orb
-
-        ## compute sides
-
-        scans_nb = np.ceil(((overpass.falltime - overpass.risetime).seconds +
-                            (overpass.falltime - overpass.risetime).microseconds
-                            / 1000000.0) * 6 / decimate)
-
-        sides_lons, sides_lats = self.get_instrument_points(self.overpass,
-                                                            overpass.risetime,
-                                                            scans_nb,
-                                                            np.array([0, 2047]),
-                                                            decimate=decimate)
-
-        self.left_lons = sides_lons[::-1, 0]
-        self.left_lats = sides_lats[::-1, 0]
-        self.right_lons = sides_lons[:, 1]
-        self.right_lats = sides_lats[:, 1]
-
-        ## compute bottom
-
-        # avhrr
-        maxval = 2048
-        rest = maxval % decimate
-        reduced = np.hstack([0, np.arange(rest/2, maxval, decimate), maxval -1])
-
-        lons, lats = self.get_instrument_points(self.overpass,
-                                                overpass.falltime,
-                                                1,
-                                                reduced)
-
-        self.bottom_lons = lons[0][::-1]
-        self.bottom_lats = lats[0][::-1]
-
-        ## compute top
-
-        lons, lats = self.get_instrument_points(self.overpass,
-                                                overpass.risetime,
-                                                1,
-                                                reduced)
-
-        self.top_lons = lons[0]
-        self.top_lats = lats[0]
-
-        self._contour_poly = None
-
-    def decimate(self, ratio):
-        l = len(self.top_lons)
-        start = (l % ratio) / 2
-        points = np.concatenate(([0], np.arange(start, l, ratio), [l-1]))
-
-        self.top_lons = self.top_lons[points]
-        self.top_lats = self.top_lats[points]
-        self.bottom_lons = self.bottom_lons[points]
-        self.bottom_lats = self.bottom_lats[points]
-
-        l = len(self.right_lons)
-        start = (l % ratio) / 2
-        points = np.concatenate(([0], np.arange(start, l, ratio), [l-1]))
-
-        self.right_lons = self.right_lons[points]
-        self.right_lats = self.right_lats[points]
-        self.left_lons = self.left_lons[points]
-        self.left_lats = self.left_lats[points]
-
-
-    def contour(self):
-        lons = np.concatenate((self.top_lons,
-                               self.right_lons[1:-1],
-                               self.bottom_lons,
-                               self.left_lons[1:-1]))
-        lats = np.concatenate((self.top_lats,
-                               self.right_lats[1:-1],
-                               self.bottom_lats,
-                               self.left_lats[1:-1]))
-        return lons, lats
-
-
-
-class Pass(object):
     """A pass: satellite, risetime, falltime, (orbital)
     """
 
     buffer = timedelta(minutes=2)
 
-    def __init__(self, satellite, risetime, falltime, orb=None, uptime=None, instrument=None):
-        """
-
-        Arguments:
-        - `satellite`:
-        - `risetime`:
-        - `falltime`:
-        """
+    def __init__(self, satellite, risetime, falltime):
         self.satellite = satellite
         self.risetime = risetime
         self.falltime = falltime
-        self.uptime = uptime
-        self.instrument = instrument
-        self.orb = orb
         self.score = {}
-        self.old_bound = None
-        self.boundary = SwathBoundary(self)
-        # make boundary lighter.
-        #self.boundary.decimate(100)
         self.subsattrack = {"start": None,
                             "end": None}
         self.rec = False
+        self.fig = None
 
     def overlaps(self, other, delay=timedelta(seconds=0)):
-        """Check if two passes overlap.
+        """Check if two passes overlap in time.
         """
         return ((self.risetime < other.falltime + delay) and
                 (self.falltime + delay > other.risetime))
@@ -277,8 +103,9 @@ class Pass(object):
             return 0
 
     def __eq__(self, other):
-        return (self.risetime == other.risetime and
-                self.falltime == other.falltime and
+        tol = timedelta(seconds=1)
+        return (abs(self.risetime - other.risetime) < tol and
+                abs(self.falltime - other.falltime) < tol and
                 self.satellite == other.satellite)
 
     def __str__(self):
@@ -300,6 +127,26 @@ class Pass(object):
         return (duration.days * 24 * 60 * 60
                 + duration.seconds
                 + duration.microseconds * 1e-6)
+
+
+class Pass(SimplePass):
+
+    """A pass: satellite, risetime, falltime, (orbital)
+    """
+
+    def __init__(self, satellite, risetime, falltime, orb=None, uptime=None,
+                 instrument=None, tle1=None, tle2=None):
+        SimplePass.__init__(self, satellite, risetime, falltime)
+        self.uptime = uptime or (risetime + (falltime - risetime) / 2)
+        self.instrument = instrument
+        self.orb = orb or orbital.Orbital(satellite, line1=tle1, line2=tle2)
+        self._boundary = None
+
+    @property
+    def boundary(self):
+        if not self._boundary:
+            self._boundary = SwathBoundary(self)
+        return self._boundary
 
     def pass_direction(self):
         """Get the direction of the pass in (ascending, descending).
@@ -328,7 +175,6 @@ class Pass(object):
                 if root <= end and root >= start:
                     return root
 
-
         arr = np.array([nadirlat(m) for m in range(15)])
         a = np.where(np.diff(np.sign(arr)))[0]
         for guess in a:
@@ -336,27 +182,38 @@ class Pass(object):
             return self.risetime + timedelta(minutes=sublat_mins)
 
     def area_coverage(self, area_of_interest):
-        """Get the score depending on the coverage of the area of interest.
+        """Get the ratio of coverage (between 0 and 1) of the pass with the area
+        of interest.
         """
-        inter = self.boundary.contour_poly().intersection(area_of_interest.poly)
-        return inter.area() / area_of_interest.poly.area()
-
+        try:
+            area_boundary = area_of_interest.poly
+        except AttributeError:
+            area_boundary = AreaDefBoundary(area_of_interest,
+                                            frequency=500)
+            area_boundary = area_boundary.contour_poly
+        inter = self.boundary.contour_poly.intersection(area_boundary)
+        if inter is None:
+            return 0
+        return inter.area() / area_boundary.area()
 
     def save_fig(self, poly=None, directory="/tmp/plots",
                  overwrite=False, labels=None, extension=".png"):
         """Save the pass as a figure. Filename is automatically generated.
         """
         logger.debug("Save fig " + str(self))
+        rise = self.risetime.strftime("%Y%m%d%H%M%S")
+        fall = self.falltime.strftime("%Y%m%d%H%M%S")
         filename = os.path.join(directory,
-                                (self.risetime.isoformat()
-                                 + self.satellite
-                                 + self.falltime.isoformat()) + extension)
+                                (rise + self.satellite.replace(" ", "_") + fall + extension))
+
+        self.fig = filename
         if not overwrite and os.path.exists(filename):
             return filename
 
+        import matplotlib as mpl
+        mpl.use('Agg')
         import matplotlib.pyplot as plt
         plt.clf()
-        #plt.xkcd()
         with Mapper() as mapper:
             mapper.nightshade(self.uptime, alpha=0.2)
             self.draw(mapper, "-r")
@@ -374,10 +231,10 @@ class Pass(object):
         import matplotlib.pyplot as plt
         plt.clf()
         with Mapper() as mapper:
-            mapper.nightshade(self.uptime, alpha=0.2)
-            self.draw(mapper, "-r")
+            #mapper.nightshade(self.uptime, alpha=0.2)
+            self.draw(mapper, "+r")
             if poly is not None:
-                poly.draw(mapper, "-b")
+                poly.draw(mapper, "+b")
             if other_poly is not None:
                 other_poly.draw(mapper, "-g")
         plt.title(str(self))
@@ -388,7 +245,7 @@ class Pass(object):
     def draw(self, mapper, options):
         """Draw the pass to the *mapper* object (basemap).
         """
-        self.boundary.contour_poly().draw(mapper, options)
+        self.boundary.contour_poly.draw(mapper, options)
 
     def print_vcs(self, coords):
         """Should look like this::
@@ -402,7 +259,9 @@ NOAA 19           24845 20131204 001450 20131204 003003 32.0 15.2 225.6 Y   Des 
         """
 
         max_elevation = self.orb.get_observer_look(self.uptime, *coords)[1]
-        anl = self.orb.get_observer_look(self.risetime, *coords)[0]
+        anl = self.orb.get_lonlatalt(
+            self.orb.get_last_an_time(self.risetime))[0] % 360
+        #anl = self.orb.get_observer_look(self.risetime, *coords)[0]
         if self.rec:
             rec = "Y"
         else:
@@ -434,9 +293,7 @@ NOAA 19           24845 20131204 001450 20131204 003003 32.0 15.2 225.6 Y   Des 
         return line
 
 HOST = "ftp://is.sci.gsfc.nasa.gov/ancillary/ephemeris/schedule/aqua/downlink/"
-import urlparse
-import ftplib
-import socket
+
 
 def get_aqua_dumps_from_ftp(start_time, end_time, satorb):
     url = urlparse.urlparse(HOST)
@@ -447,16 +304,14 @@ def get_aqua_dumps_from_ftp(start_time, end_time, satorb):
         logger.error('cannot reach to %s ' % HOST + str(e))
         f = None
 
-
     if f is not None:
         try:
-            f.login('anonymous','guest')
+            f.login('anonymous', 'guest')
             logger.debug("Logged in")
         except ftplib.error_perm:
             logger.error('cannot login anonymously')
             f.quit()
             f = None
-
 
     if f is not None:
         data = []
@@ -484,10 +339,16 @@ def get_aqua_dumps_from_ftp(start_time, end_time, satorb):
         if not filedates[date].endswith(".rpt"):
             continue
         if not os.path.exists(os.path.join("/tmp", filedates[date])):
-            f.retrlines('RETR ' + os.path.join(url.path, filedates[date]), lines.append)
+            try:
+                f.retrlines(
+                    'RETR ' + os.path.join(url.path, filedates[date]), lines.append)
+            except ftplib.error_perm:
+                logger.info("Permission error (???) on ftp server, skipping.")
+                continue
             with open(os.path.join("/tmp", filedates[date]), "w") as fd_:
                 for line in lines:
                     fd_.write(line + "\n")
+
         else:
             with open(os.path.join("/tmp", filedates[date]), "r") as fd_:
                 for line in fd_:
@@ -535,7 +396,7 @@ def get_next_passes(satellites, utctime, forward, coords, tle_file=None):
         passlist = satorb.get_next_passes(utctime,
                                           forward,
                                           *coords)
-        if sat.startswith("metop") or sat.startswith("noaa"):
+        if sat.lower().startswith("metop") or sat.lower().startswith("noaa"):
             instrument = "avhrr"
         elif sat in ["aqua", "terra"]:
             instrument = "modis"
@@ -546,7 +407,7 @@ def get_next_passes(satellites, utctime, forward, coords, tle_file=None):
         # take care of metop-a
         if sat == "metop-a":
             metop_passes = [Pass(sat, rtime, ftime, satorb, uptime, instrument)
-                            for rtime, ftime, uptime in passlist]
+                            for rtime, ftime, uptime in passlist if rtime < ftime]
 
             passes["metop-a"] = []
             for overpass in metop_passes:
@@ -565,53 +426,54 @@ def get_next_passes(satellites, utctime, forward, coords, tle_file=None):
                                                  forward + 1,
                                                  *wpcoords)
             wp_passes = [Pass(sat, rtime, ftime, satorb, uptime, instrument)
-                         for rtime, ftime, uptime in passlist_wp]
+                         for rtime, ftime, uptime in passlist_wp if rtime < ftime]
 
             svcoords = (15.399, 78.228, 0)
             passlist_sv = satorb.get_next_passes(utctime - timedelta(minutes=30),
                                                  forward + 1,
                                                  *svcoords)
             sv_passes = [Pass(sat, rtime, ftime, satorb, uptime, instrument)
-                         for rtime, ftime, uptime in passlist_sv]
+                         for rtime, ftime, uptime in passlist_sv if rtime < ftime]
             pfcoords = (-147.43, 65.12, 0.51)
             passlist_pf = satorb.get_next_passes(utctime - timedelta(minutes=30),
                                                  forward + 1,
                                                  *pfcoords)
             pf_passes = [Pass(sat, rtime, ftime, satorb, uptime, instrument)
-                         for rtime, ftime, uptime in passlist_pf]
+                         for rtime, ftime, uptime in passlist_pf if rtime < ftime]
 
             aqua_passes = [Pass(sat, rtime, ftime, satorb, uptime, instrument)
-                           for rtime, ftime, uptime in passlist]
+                           for rtime, ftime, uptime in passlist if rtime < ftime]
 
             dumps = get_aqua_dumps_from_ftp(utctime - timedelta(minutes=30),
-                                            utctime + timedelta(hours=forward+0.5),
+                                            utctime +
+                                            timedelta(hours=forward + 0.5),
                                             satorb)
 
             # remove the known dumps
             for dump in dumps:
-                #print "*", dump.station, dump, dump.max_elev
+                # print "*", dump.station, dump, dump.max_elev
                 logger.debug("dump from ftp: " + str((dump.station, dump,
                                                       dump.max_elev)))
                 for i, sv_pass in enumerate(sv_passes):
                     if sv_pass.overlaps(dump, timedelta(minutes=40)):
                         sv_elevation = sv_pass.orb.get_observer_look(sv_pass.uptime,
                                                                      *svcoords)[1]
-                        logger.debug("Computed " +str(("SG", sv_pass,
-                                                       sv_elevation)))
+                        logger.debug("Computed " + str(("SG", sv_pass,
+                                                        sv_elevation)))
                         del sv_passes[i]
                 for i, pf_pass in enumerate(pf_passes):
                     if pf_pass.overlaps(dump, timedelta(minutes=40)):
                         pf_elevation = pf_pass.orb.get_observer_look(pf_pass.uptime,
                                                                      *pfcoords)[1]
-                        logger.debug("Computed " +str(("PF", pf_pass,
-                                                       pf_elevation)))
+                        logger.debug("Computed " + str(("PF", pf_pass,
+                                                        pf_elevation)))
                         del pf_passes[i]
                 for i, wp_pass in enumerate(wp_passes):
                     if wp_pass.overlaps(dump, timedelta(minutes=40)):
                         wp_elevation = wp_pass.orb.get_observer_look(wp_pass.uptime,
                                                                      *wpcoords)[1]
-                        logger.debug("Computed " +str(("WP", wp_pass,
-                                                       wp_elevation)))
+                        logger.debug("Computed " + str(("WP", wp_pass,
+                                                        wp_elevation)))
                         del wp_passes[i]
 
             # sort out dump passes first
@@ -643,14 +505,13 @@ def get_next_passes(satellites, utctime, forward, coords, tle_file=None):
                 if pf_pass not in used_pf:
                     dumps.append(pf_pass)
 
-
             passes["aqua"] = []
             for overpass in aqua_passes:
                 add = True
                 for dump_pass in dumps:
                     if dump_pass.overlaps(overpass):
                         if (dump_pass.uptime < overpass.uptime and
-                            dump_pass.falltime > overpass.risetime):
+                                dump_pass.falltime > overpass.risetime):
                             logger.debug("adjusting " + str(overpass)
                                          + " to new risetime " +
                                          str(dump_pass.falltime))
@@ -674,12 +535,11 @@ def get_next_passes(satellites, utctime, forward, coords, tle_file=None):
                            for rtime, ftime, uptime in passlist
                            if ftime - rtime > timedelta(minutes=MIN_PASS)]
 
-
     return set(reduce(operator.concat, passes.values()))
 
 if __name__ == '__main__':
-    from datetime import datetime
     from trollsched.satpass import get_next_passes
-    passes = get_next_passes(["noaa 19", "suomi npp"], datetime.now(), 24, (16, 58, 0))
+    passes = get_next_passes(
+        ["noaa 19", "suomi npp"], datetime.now(), 24, (16, 58, 0))
     for p in passes:
         p.save_fig(directory="/tmp/plots/")
